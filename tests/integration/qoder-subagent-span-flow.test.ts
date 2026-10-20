@@ -112,7 +112,7 @@ function ts(seconds: number, millis = 0): string {
 }
 
 /** Parent transcript with one Turn carrying every dispatched Agent call id. */
-function writeParentTranscript(callIds: string[]): void {
+function writeParentTranscript(callIds: string[], opts: { usage?: boolean } = {}): void {
   const rows = [
     {
       type: 'session_meta', sessionId: 'subagent-session', uuid: 'meta-1', timestamp: ts(0),
@@ -127,6 +127,9 @@ function writeParentTranscript(callIds: string[]): void {
       message: {
         id: 'resp_parent0000000000000000000000000000000000000000000000000001',
         role: 'assistant', model: 'ultimate', stop_reason: 'tool_use',
+        ...(opts.usage ? {
+          usage: { input_tokens: 2000, output_tokens: 40, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+        } : {}),
         content: callIds.map(id => ({
           type: 'tool_use', id, name: 'Agent',
           input: { prompt: 'run echo hello', subagent_type: 'general-purpose', description: 'echo test' },
@@ -142,6 +145,9 @@ function writeParentTranscript(callIds: string[]): void {
       message: {
         id: 'resp_parent_final0000000000000000000000000000000000000000000000001',
         role: 'assistant', model: 'ultimate', stop_reason: 'end_turn',
+        ...(opts.usage ? {
+          usage: { input_tokens: 2500, output_tokens: 25, cache_read_input_tokens: 1200 },
+        } : {}),
         content: [{ type: 'text', text: 'The subagent has finished the task.' }],
       },
     },
@@ -153,7 +159,7 @@ function writeParentTranscript(callIds: string[]): void {
   fs.writeFileSync(transcriptPath, `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
 }
 
-function installChild(callId: string, taskId: string, agentId: string): void {
+function installChild(callId: string, taskId: string, agentId: string, opts: { usage?: boolean } = {}): void {
   const subagentsDir = path.join(sessionDir, 'subagents');
   fs.mkdirSync(subagentsDir, { recursive: true });
   const base = JSON.parse(fs.readFileSync(
@@ -171,6 +177,24 @@ function installChild(callId: string, taskId: string, agentId: string): void {
     path.join(FIXTURES, 'subagent-session', 'subagents', `agent-${SUBAGENT_ID}.jsonl`),
     path.join(subagentsDir, `agent-${agentId}.jsonl`),
   );
+  if (opts.usage) {
+    const childPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+    const rows = fs.readFileSync(childPath, 'utf-8').trim().split('\n')
+      .map(line => JSON.parse(line) as Record<string, any>);
+    for (const row of rows) {
+      if (row.type !== 'assistant' || !row.message?.stop_reason) continue;
+      // Each provider call ends on its own row; the first call in the fixture
+      // stops with tool_use, the second with end_turn.
+      const firstCall = String(row.message.id).endsWith('1');
+      row.message.usage = {
+        input_tokens: firstCall ? 300 : 420,
+        output_tokens: firstCall ? 12 : 18,
+        cache_read_input_tokens: firstCall ? 200 : 260,
+        ...(firstCall ? { cache_creation_input_tokens: 40 } : {}),
+      };
+    }
+    fs.writeFileSync(childPath, `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+  }
 }
 
 const spansOf = (kind: string) => captured.filter(s => s.attributes['gen_ai.span.kind'] === kind);
@@ -286,5 +310,82 @@ describe('Qoder subagent Hook → normalization → real OTLP span conversion', 
     expect(childB!.attributes['gen_ai.agent.id']).toBe(CHILD_AGENT_B);
     expect(new Set([childA, childB].map(s => s!.spanContext().spanId)).size).toBe(2);
     assertTree();
+  });
+
+  it('exports provider token usage on parent and child LLM spans only', async () => {
+    writeParentTranscript([AGENT_CALL_A], { usage: true });
+    installChild(AGENT_CALL_A, 'ataskusage0000000000001', SUBAGENT_ID, { usage: true });
+
+    runProcessor();
+    await exportHistory();
+
+    const childAgent = childAgentSpanFor(AGENT_CALL_A);
+    expect(childAgent).toBeDefined();
+    const childLlm = descendantsOf(childAgent!).filter(s => s.attributes['gen_ai.span.kind'] === 'LLM');
+    const childIds = new Set(childLlm.map(s => s.spanContext().spanId));
+    const parentLlm = spansOf('LLM').filter(s => !childIds.has(s.spanContext().spanId));
+
+    expect(parentLlm).toHaveLength(2);
+    expect(parentLlm[0].attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 2000,
+      'gen_ai.usage.output_tokens': 40,
+      'gen_ai.usage.total_tokens': 2040,
+      'gen_ai.usage.cache_read.input_tokens': 1000,
+      'gen_ai.usage.cache_creation.input_tokens': 200,
+    });
+    expect(parentLlm[1].attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 2500,
+      'gen_ai.usage.output_tokens': 25,
+      'gen_ai.usage.total_tokens': 2525,
+      'gen_ai.usage.cache_read.input_tokens': 1200,
+    });
+    expect(parentLlm[1].attributes['gen_ai.usage.cache_creation.input_tokens']).toBeUndefined();
+
+    expect(childLlm).toHaveLength(2);
+    childLlm.sort((a, b) => milliseconds(a.startTime) - milliseconds(b.startTime));
+    expect(childLlm[0].attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 300,
+      'gen_ai.usage.output_tokens': 12,
+      'gen_ai.usage.total_tokens': 312,
+      'gen_ai.usage.cache_read.input_tokens': 200,
+      'gen_ai.usage.cache_creation.input_tokens': 40,
+    });
+    expect(childLlm[1].attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 420,
+      'gen_ai.usage.output_tokens': 18,
+      'gen_ai.usage.total_tokens': 438,
+      'gen_ai.usage.cache_read.input_tokens': 260,
+    });
+
+    // The shared converter sums the LLM responses of a turn onto its AGENT
+    // span (the child subtree has its own turn-level accumulator), so the
+    // delegation cost is readable without walking every child LLM span.
+    const parentAgent = spansOf('AGENT').find(s => s.attributes['gen_ai.agent.scope'] === undefined);
+    expect(parentAgent!.attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 4500,
+      'gen_ai.usage.output_tokens': 65,
+      'gen_ai.usage.total_tokens': 4565,
+      'gen_ai.usage.cache_read.input_tokens': 2200,
+      'gen_ai.usage.cache_creation.input_tokens': 200,
+    });
+    expect(childAgent!.attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 720,
+      'gen_ai.usage.output_tokens': 30,
+      'gen_ai.usage.total_tokens': 750,
+      'gen_ai.usage.cache_read.input_tokens': 460,
+      'gen_ai.usage.cache_creation.input_tokens': 40,
+    });
+
+    // Usage belongs to LLM spans and their turn-level AGENT aggregate only.
+    for (const span of captured.filter(s => {
+      const kind = s.attributes['gen_ai.span.kind'];
+      return kind !== 'LLM' && kind !== 'AGENT';
+    })) {
+      for (const key of [
+        'gen_ai.usage.input_tokens',
+        'gen_ai.usage.output_tokens',
+        'gen_ai.usage.total_tokens',
+      ]) expect(span.attributes[key]).toBeUndefined();
+    }
   });
 });

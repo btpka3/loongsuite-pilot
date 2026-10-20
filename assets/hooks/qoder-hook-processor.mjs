@@ -1036,6 +1036,44 @@ export function buildLlmBoundaries(_progressEvents, contentEvents) {
 
 // --- Event Builder -----------------------------------------------------------
 
+function countValue(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * qodercli puts usage on the assistant row that closes a streamed response.
+ * `input_tokens` is already the inclusive prompt size (cache_read included),
+ * and the transcript carries no total_tokens, so total is derived here.
+ */
+export function collectStepUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const input = countValue(usage.input_tokens);
+  const output = countValue(usage.output_tokens);
+  if (input === undefined && output === undefined) return null;
+  return {
+    input: input ?? 0,
+    output: output ?? 0,
+    cacheRead: countValue(usage.cache_read_input_tokens),
+    cacheCreation: countValue(usage.cache_creation_input_tokens),
+  };
+}
+
+export function usageAttributes(usage) {
+  const step = collectStepUsage(usage);
+  if (!step) return {};
+  return {
+    'gen_ai.usage.input_tokens': step.input,
+    'gen_ai.usage.output_tokens': step.output,
+    'gen_ai.usage.total_tokens': step.input + step.output,
+    ...(step.cacheRead !== undefined
+      ? { 'gen_ai.usage.cache_read.input_tokens': step.cacheRead }
+      : {}),
+    ...(step.cacheCreation !== undefined
+      ? { 'gen_ai.usage.cache_creation.input_tokens': step.cacheCreation }
+      : {}),
+  };
+}
+
 export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId, sessionId, agentId, runtimeConfig, cwd) {
   const records = [];
   const observedTs = timestampToUnixNanos(Date.now());
@@ -1169,12 +1207,14 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
     let responseId = undefined;
     let clientRequestId = undefined;
     let firstAssistantTs = null;
+    let stepUsage = null;
 
     for (const row of content) {
       if (row.type === 'assistant') {
         const msg = row.message || {};
         const blocks = Array.isArray(msg.content) ? msg.content : [];
         if (msg.id && !responseId) responseId = msg.id;
+        if (msg.usage && typeof msg.usage === 'object') stepUsage = msg.usage;
         // The CLI's own request id, carried on the usage object of the row that
         // closes a streamed response (msg.id lands on the first row instead, so
         // the two cannot be read from the same row).
@@ -1242,6 +1282,7 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         'gen_ai.response.id': responseId,
         ...(finishReason ? { 'gen_ai.response.finish_reasons': [finishReason] } : {}),
         'user.id': userId,
+        ...usageAttributes(stepUsage),
         'gen_ai.output.messages': [{
           role: 'assistant',
           parts: outputParts,
@@ -1808,13 +1849,14 @@ function parseSubagentTranscript(file) {
       if (!call) {
         call = {
           id, model: msg.model || 'auto', ts, endTs: ts,
-          stopReason: msg.stop_reason, parts: [], toolUses: [],
+          stopReason: msg.stop_reason, parts: [], toolUses: [], usage: null,
         };
         callById.set(id, call);
         calls.push(call);
       }
       call.endTs = ts;
       if (msg.stop_reason) call.stopReason = msg.stop_reason;
+      if (msg.usage && typeof msg.usage === 'object') call.usage = msg.usage;
       for (const b of msg.content || []) {
         if (!b || typeof b !== 'object') continue;
         if (b.type === 'thinking' && b.thinking) {
@@ -1931,6 +1973,7 @@ function buildSubagentRecords(task, turnContext, parsed, runtimeConfig) {
       'gen_ai.response.model': call.model,
       'gen_ai.response.id': call.id,
       ...(finishReason ? { 'gen_ai.response.finish_reasons': [finishReason] } : {}),
+      ...usageAttributes(call.usage),
       'gen_ai.output.messages': [{
         role: 'assistant',
         parts: call.parts,
