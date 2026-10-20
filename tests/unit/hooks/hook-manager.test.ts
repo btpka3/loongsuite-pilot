@@ -27,6 +27,29 @@ describe('HookManager', () => {
     expect(def.useNestedFormat).toBe(true);
   });
 
+  it('registers Qoder CLI for both Stop and StopFailure', () => {
+    const defs = HookManager.buildQoderCliHooks('/opt/loongsuite-pilot');
+
+    expect(defs.map(def => def.hookJsonPath)).toEqual([
+      ['hooks', 'Stop'],
+      ['hooks', 'StopFailure'],
+    ]);
+    expect(new Set(defs.map(def => def.hookCommand)).size).toBe(1);
+    expect(defs.every(def => def.agentId === 'qoder')).toBe(true);
+    // The deprecated single-definition accessor must stay on Stop.
+    expect(HookManager.buildQoderCliHook('/opt/loongsuite-pilot').hookJsonPath)
+      .toEqual(['hooks', 'Stop']);
+  });
+
+  it('declares StopFailure for Qoder in the agent definition', async () => {
+    const definition = JSON.parse(await fs.readFile(
+      new URL('../../../agents.d/qoder.json', import.meta.url),
+      'utf-8',
+    ));
+
+    expect(definition.hook.events).toEqual(['Stop', 'StopFailure']);
+  });
+
   it('builds QwenWorkCN hooks with an independent entrypoint', () => {
     const [def] = HookManager.buildQwenWorkCNHooks('/opt/loongsuite-pilot');
 

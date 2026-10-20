@@ -226,9 +226,12 @@ async function main() {
     const sessionIdx = args.indexOf('--session');
     const cwdIdx = args.indexOf('--cwd');
     const triggerEndLineIdx = args.indexOf('--trigger-end-line');
+    const errorTypeIdx = args.indexOf('--error-type');
     const transcriptPath = transcriptIdx >= 0 ? args[transcriptIdx + 1] : '';
     const sessionId = sessionIdx >= 0 ? args[sessionIdx + 1] : '';
     const cwd = cwdIdx >= 0 ? args[cwdIdx + 1] : undefined;
+    const isFailure = args.includes('--failure');
+    const failureErrorType = errorTypeIdx >= 0 ? args[errorTypeIdx + 1] : undefined;
     const triggerEndLine = triggerEndLineIdx >= 0
       ? Number.parseInt(args[triggerEndLineIdx + 1], 10)
       : Number.NaN;
@@ -261,6 +264,57 @@ async function main() {
       let targetWindow = null;
       let retrySnapshot = null;
       let range = null;
+      if (isFailure) {
+        // An API error ends the turn without a Stop/last-prompt marker, so the
+        // Stop-anchored window logic below cannot apply. Wait until the
+        // transcript stops growing (the synthetic error row is written after
+        // the hook fires), then take the last prompt through the next prompt.
+        retrySnapshot = await readStableFailureSnapshot(transcriptPath);
+        range = getLineRangeInfo(
+          agentId,
+          transcriptPath,
+          sessionId,
+          retrySnapshot.lineCount,
+        );
+        if (!range) return;
+        targetWindow = findFailureTurnWindow(retrySnapshot, triggerEndLine);
+        if (!targetWindow) {
+          logDebug(agentId, 'Failure export skipped: no prompt found in transcript');
+          return;
+        }
+        if (range.startLine >= targetWindow.endLine) {
+          logDebug(
+            agentId,
+            `Failure export skipped: cursor ${range.startLine} already passed ${targetWindow.endLine}`,
+          );
+          return;
+        }
+        const failureStartLine = Math.max(range.startLine, targetWindow.startLine);
+        logDebug(
+          agentId,
+          `Failure target window: range=${failureStartLine}-${targetWindow.endLine}`,
+        );
+        const committed = await processTranscript(
+          agentId, logPrefix, transcriptPath, sessionId,
+          failureStartLine, targetWindow.endLine,
+          runtimeConfig, cwd,
+          {
+            delayApplied: true,
+            rangeReason: range.reason,
+            fixedTurnWindow: true,
+            snapshot: retrySnapshot,
+            failure: { errorType: failureErrorType },
+          },
+        );
+        if (committed === false) {
+          logDebug(agentId, `Failure commit failed; rescheduling ${transcriptPath}`);
+          spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd, triggerEndLine, {
+            failure: true,
+            errorType: failureErrorType,
+          });
+        }
+        return;
+      }
       if (Number.isFinite(triggerEndLine)) {
         // Stop may be appended only after the hook process receives its
         // payload. Poll briefly for that Stop and a stable right boundary,
@@ -360,6 +414,7 @@ async function main() {
   if (!payload) return;
 
   const { transcriptPath, sessionId, cwd } = payload;
+  const isStopFailure = payload.hookEventName === 'StopFailure';
 
   // 方案1(env):首个 turn 读 TRACEPARENT 写 session 级关联记录(fail-open, 每 session 一次)
   if (sessionId) {
@@ -378,6 +433,19 @@ async function main() {
   const endLine = range.endLine;
   const parsed = snapshot.rows.slice(startLine, endLine).filter(Boolean);
   logDebug(agentId, `Read ${parsed.length} lines (range: ${startLine}-${endLine})`);
+
+  // StopFailure races the transcript flush just like Stop does, and an empty
+  // range here may simply mean the synthetic error row is not durable yet.
+  // Always hand it to the delayed retry, which waits for a stable snapshot.
+  if (isStopFailure) {
+    logDebug(agentId, `StopFailure: scheduling failure export for ${transcriptPath}`);
+    spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd, endLine, {
+      failure: true,
+      errorType: payload.error,
+    });
+    return;
+  }
+
   if (!parsed.length) {
     if (!tryAcquireRetryLock(transcriptPath, sessionId)) {
       logDebug(agentId, `Empty range deferred: transcript lock held for ${transcriptPath}`);
@@ -463,7 +531,7 @@ async function main() {
   }
 }
 
-function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd, triggerEndLine) {
+function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd, triggerEndLine, options) {
   const nodebin = process.argv[0];
   const script = fileURLToPath(import.meta.url);
   const spawnArgs = [
@@ -474,12 +542,18 @@ function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd, t
     '--transcript', transcriptPath,
     '--session', sessionId,
     '--trigger-end-line', String(triggerEndLine),
+    ...(options?.failure ? ['--failure'] : []),
+    ...(options?.failure && options.errorType
+      ? ['--error-type', String(options.errorType)]
+      : []),
     ...(cwd ? ['--cwd', cwd] : []),
   ];
   const child = spawn(nodebin, spawnArgs, {
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, HOOK_RETRY_DELAY: '5000' },
+    // Preserve the delay default while letting a test (or an operator) drive
+    // the retry deterministically through the inherited environment.
+    env: { ...process.env, HOOK_RETRY_DELAY: process.env.HOOK_RETRY_DELAY || '5000' },
   });
   child.unref();
   logDebug(agentId, `Spawned retry subprocess (PID ${child.pid})`);
@@ -625,6 +699,7 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
 
     const turnRecords = buildEventsFromBoundaries(
       llmBoundaries, turnContentEvents, parsed, turnId, sessionId, agentId, runtimeConfig, cwd,
+      opts?.failure,
     );
     records.push(...turnRecords);
 
@@ -701,6 +776,100 @@ export function readTranscriptSnapshot(transcriptPath, { includeContentHash = fa
   } catch {
     return { lineCount: 0, rows: [], contentHash: '', reason: 'read-failed' };
   }
+}
+
+/**
+ * Wait until the transcript stops growing before reading a failed turn. The
+ * StopFailure hook can run before qodercli flushes its synthetic error row, so
+ * the first snapshot may still be the pre-error file.
+ */
+export async function readStableFailureSnapshot(transcriptPath) {
+  const maxPolls = 3;
+  const intervalMs = clampInteger(
+    process.env.HOOK_FAILURE_STABILITY_INTERVAL_MS,
+    200,
+    10,
+    2000,
+  );
+  let previousHash = null;
+  let snapshot = null;
+  for (let poll = 0; poll < maxPolls; poll++) {
+    snapshot = readTranscriptSnapshot(transcriptPath, { includeContentHash: true });
+    if (snapshot.reason !== 'ok') return snapshot;
+    if (snapshot.contentHash === previousHash) return snapshot;
+    previousHash = snapshot.contentHash;
+    if (poll + 1 < maxPolls) {
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * A StopFailure has no Stop/last-prompt anchor: the turn runs from its own
+ * prompt to the next prompt (or EOF). triggerEndLine is the EOF observed when
+ * the hook fired; it bounds the prompt search so a turn queued during the retry
+ * delay cannot be mistaken for the failed one.
+ */
+export function findFailureTurnWindow(snapshot, triggerEndLine) {
+  if (snapshot?.reason !== 'ok') return null;
+  const rows = snapshot.rows;
+  const limit = snapshot.lineCount;
+  const promptLimit = Number.isFinite(triggerEndLine)
+    ? Math.min(Math.max(triggerEndLine, 0), limit)
+    : limit;
+
+  let startLine = -1;
+  let startFromPrompt = false;
+  for (let i = promptLimit - 1; i >= 0; i--) {
+    if (hookEventOf(rows[i]) === 'UserPromptSubmit') {
+      startLine = i;
+      break;
+    }
+  }
+  if (startLine < 0) {
+    for (let i = promptLimit - 1; i >= 0; i--) {
+      if (isRealUserPrompt(rows[i])) {
+        startLine = i;
+        startFromPrompt = true;
+        break;
+      }
+    }
+  }
+  if (startLine < 0) return null;
+
+  // A progress marker alone is not a turn: the user row must also be durable,
+  // otherwise the failure export would synthesize a call from nothing.
+  if (!startFromPrompt && !rows.slice(startLine + 1).some(isRealUserPrompt)) {
+    return null;
+  }
+
+  // Skip the failed turn's own user row (it follows its UserPromptSubmit
+  // marker); only a second prompt starts the next turn.
+  let ownPromptSeen = false;
+  let endLine = limit;
+  for (let i = startLine + 1; i < limit; i++) {
+    const hookEvent = hookEventOf(rows[i]);
+    if (hookEvent === 'UserPromptSubmit') {
+      endLine = i;
+      break;
+    }
+    if (isRealUserPrompt(rows[i])) {
+      if (!ownPromptSeen) {
+        ownPromptSeen = true;
+        continue;
+      }
+      endLine = i;
+      break;
+    }
+  }
+  return {
+    status: 'complete',
+    reason: 'stop-failure',
+    startLine,
+    stopLine: null,
+    endLine,
+  };
 }
 
 export function assessStableEofCandidate(previousKey, targetWindow, snapshot) {
@@ -1074,7 +1243,36 @@ export function usageAttributes(usage) {
   };
 }
 
-export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId, sessionId, agentId, runtimeConfig, cwd) {
+function normalizeFailureType(value) {
+  if (typeof value !== 'string') return 'model_error';
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 64);
+  return normalized || 'model_error';
+}
+
+/**
+ * qodercli appends a synthetic assistant row when the model API fails:
+ * `isApiErrorMessage: true` plus a top-level `error`/`errorDetails`. Its text
+ * can carry raw upstream/private detail, so only the machine-readable code and
+ * status are ever persisted.
+ */
+function failureInfoOf(row) {
+  if (row?.type !== 'assistant') return null;
+  if (row.isApiErrorMessage !== true && row.error === undefined) return null;
+  const rawType = typeof row.error === 'string'
+    ? row.error
+    : (row.error && typeof row.error === 'object' && typeof row.error.type === 'string'
+      ? row.error.type
+      : row.displayErrorCode);
+  const status = Number(row.apiErrorStatus);
+  return {
+    type: normalizeFailureType(rawType),
+    statusCode: Number.isInteger(status) && status >= 100 && status <= 599
+      ? status
+      : undefined,
+  };
+}
+
+export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId, sessionId, agentId, runtimeConfig, cwd, failure) {
   const records = [];
   const observedTs = timestampToUnixNanos(Date.now());
 
@@ -1084,6 +1282,66 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
   const userId = resolveUserId(userRow || contentEvents[0], runtimeConfig);
   const agentType = inferVariant(userRow || contentEvents[0], agentId);
   const providerName = inferProviderName({ 'gen_ai.agent.type': agentType });
+  const modelFallback = [...contentEvents].reverse()
+    .find(r => r.type === 'assistant' && r.message?.model)?.message?.model || 'unknown';
+  let failureEmitted = false;
+
+  // The StopFailure hook can fire before (or without) qodercli writing its
+  // synthetic error row. When no boundary carried failure evidence, append one
+  // explicit failed LLM call so the turn still produces a trace instead of
+  // being dropped as an orphan request.
+  function appendFailureStep(stepIndex, precedingNanos, fallbackStartNanos) {
+    if (failureEmitted) return;
+    failureEmitted = true;
+    const stepId = `${turnId}:s${stepIndex}`;
+    const responseNanos = timestampToUnixNanos(Date.now());
+    const { startNanos, endNanos } = orderedLlmInterval(
+      precedingNanos,
+      responseNanos,
+      fallbackStartNanos,
+    );
+    const failureType = normalizeFailureType(failure?.errorType);
+    records.push({
+      'event.id': crypto.randomUUID(),
+      'event.name': 'llm.request',
+      'gen_ai.step.id': stepId,
+      'gen_ai.turn.id': turnId,
+      'gen_ai.session.id': sessionId,
+      'gen_ai.agent.type': agentType,
+      'gen_ai.provider.name': providerName,
+      'gen_ai.request.model': modelFallback,
+      'user.id': userId,
+      ...(stepIndex === 1 && userRow
+        ? {
+            'gen_ai.input.messages_delta': [{
+              role: 'user',
+              parts: buildUserMessageParts(extractUserText(userRow), contentEvents, agentType),
+            }],
+          }
+        : {}),
+      'agent.source': 'qoder-transcript-hook',
+      time_unix_nano: startNanos,
+      observed_time_unix_nano: observedTs,
+    });
+    records.push({
+      'event.id': crypto.randomUUID(),
+      'event.name': 'llm.response',
+      'gen_ai.step.id': stepId,
+      'gen_ai.turn.id': turnId,
+      'gen_ai.session.id': sessionId,
+      'gen_ai.agent.type': agentType,
+      'gen_ai.provider.name': providerName,
+      'gen_ai.request.model': modelFallback,
+      'gen_ai.response.model': modelFallback,
+      'gen_ai.response.finish_reasons': ['error'],
+      'error.type': failureType,
+      'user.id': userId,
+      'agent.source': 'qoder-transcript-hook',
+      'agent.stop_reason': 'error',
+      time_unix_nano: endNanos,
+      observed_time_unix_nano: observedTs,
+    });
+  }
 
   // User-hook event (ENTRY input)
   if (userRow) {
@@ -1114,6 +1372,14 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
   // entry `other` is already in `records`, so hand the legacy path only the rows
   // it still owns. Qoder encodes tool results as type=user, so they must survive.
   if (boundaries.length === 0) {
+    if (failure) {
+      appendFailureStep(
+        1,
+        userRow ? [isoToUnixNanos(userRow.timestamp)] : [],
+        userRow ? isoToUnixNanos(userRow.timestamp) : '',
+      );
+      return finalizeRecords(records, cwd);
+    }
     const residualEvents = contentEvents.filter(
       row => row.type === 'assistant' || isToolResult(row),
     );
@@ -1255,8 +1521,15 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
     // falling back to inference when not available.
     const lastStopReason = [...content].reverse()
       .find(r => r.type === 'assistant' && r.message?.stop_reason)?.message?.stop_reason;
+    let failureInfo = null;
+    for (const row of content) {
+      const info = failureInfoOf(row);
+      if (info) failureInfo = info;
+    }
     let finishReason;
-    if (toolCalls.length > 0) {
+    if (failureInfo) {
+      finishReason = 'error';
+    } else if (toolCalls.length > 0) {
       finishReason = 'tool_call';
     } else if (lastStopReason === 'max_tokens') {
       finishReason = 'max_tokens';
@@ -1268,7 +1541,8 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
       finishReason = 'stop';
     }
 
-    if (outputParts.length > 0) {
+    if (outputParts.length > 0 || failureInfo) {
+      if (failureInfo) failureEmitted = true;
       records.push({
         'event.id': crypto.randomUUID(),
         'event.name': 'llm.response',
@@ -1281,13 +1555,22 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         'gen_ai.response.model': stepModel,
         'gen_ai.response.id': responseId,
         ...(finishReason ? { 'gen_ai.response.finish_reasons': [finishReason] } : {}),
+        ...(failureInfo ? { 'error.type': failureInfo.type } : {}),
+        ...(failureInfo?.statusCode !== undefined
+          ? { 'http.response.status_code': failureInfo.statusCode }
+          : {}),
         'user.id': userId,
-        ...usageAttributes(stepUsage),
-        'gen_ai.output.messages': [{
-          role: 'assistant',
-          parts: outputParts,
-          ...(finishReason ? { finish_reason: finishReason } : {}),
-        }],
+        // Error rows carry zero/partial usage; emitting it would read as a
+        // real zero-token call. content is dropped for the same reason: the
+        // synthetic error text may contain raw upstream detail.
+        ...usageAttributes(failureInfo ? null : stepUsage),
+        ...(!failureInfo ? {
+          'gen_ai.output.messages': [{
+            role: 'assistant',
+            parts: outputParts,
+            ...(finishReason ? { finish_reason: finishReason } : {}),
+          }],
+        } : {}),
         'agent.source': 'qoder-transcript-hook',
         // Raw vendor stop_reason, kept because normalizeFinishReason may map it
         // onto a different enum value or drop it. Deliberately a single segment
@@ -1373,6 +1656,14 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         });
       }
     }
+  }
+
+  if (failure && !failureEmitted) {
+    appendFailureStep(
+      boundaries.length + 1,
+      [previousResponseNanos, ...toolResultsForNextStep.map(r => isoToUnixNanos(r.resultTs || ''))],
+      previousResponseNanos || (userRow ? isoToUnixNanos(userRow.timestamp) : ''),
+    );
   }
 
   return finalizeRecords(records, cwd);

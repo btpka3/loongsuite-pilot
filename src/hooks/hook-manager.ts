@@ -471,23 +471,25 @@ export class HookManager {
   }
 
   /**
-   * Build hook definitions for Qoder CLI (Stop only).
+   * Build hook definitions for Qoder CLI (Stop + StopFailure).
+   *
+   * StopFailure is a separate event: an API error ends the turn without a Stop
+   * hook, so without it a failed turn would never be exported. Both events use
+   * the same entrypoint; the processor reads hook_event_name from stdin.
    */
   static buildQoderCliHooks(loongsuitePilotDir?: string): HookDefinition[] {
     const baseDir = loongsuitePilotDir ?? resolveHome('~/.loongsuite-pilot');
     const command = wrapHookCommand(`${baseDir}/hooks/qoder-loongsuite-pilot-hook${hookExt}`, 'qoder');
     const settingsPath = resolveHome('~/.qoder/settings.json');
 
-    return [
-      {
-        agentId: 'qoder',
-        settingsPath,
-        hookJsonPath: ['hooks', 'Stop'],
-        hookCommand: command,
-        matcher: '*',
-        useNestedFormat: true,
-      },
-    ];
+    return ['Stop', 'StopFailure'].map(event => ({
+      agentId: 'qoder',
+      settingsPath,
+      hookJsonPath: ['hooks', event],
+      hookCommand: command,
+      matcher: '*',
+      useNestedFormat: true,
+    }));
   }
 
   /**
@@ -568,7 +570,8 @@ export class HookManager {
    * @deprecated Use buildQoderCliHooks() instead.
    */
   static buildQoderCliHook(loongsuitePilotDir?: string): HookDefinition {
-    return HookManager.buildQoderCliHooks(loongsuitePilotDir)[1];
+    // Index 0 stays the Stop definition; StopFailure is appended after it.
+    return HookManager.buildQoderCliHooks(loongsuitePilotDir)[0];
   }
 
   /**

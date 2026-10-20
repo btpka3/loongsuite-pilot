@@ -469,7 +469,19 @@ export async function parseStdinPayload(agentId) {
   }
 
   const cwd = typeof payload.cwd === 'string' && payload.cwd ? payload.cwd : undefined;
-  return { transcriptPath, sessionId, cwd };
+  // StopFailure carries the event name and structured failure data. Only the
+  // machine-readable error code is safe to persist: error_details and
+  // last_assistant_message may contain raw upstream/private text.
+  const hookEventName = typeof payload.hook_event_name === 'string'
+    ? payload.hook_event_name
+    : '';
+  const rawError = payload.error;
+  const error = typeof rawError === 'string'
+    ? rawError
+    : (rawError && typeof rawError === 'object' && typeof rawError.type === 'string'
+      ? rawError.type
+      : undefined);
+  return { transcriptPath, sessionId, cwd, hookEventName, error };
 }
 
 // --- Re-export normalizer utilities -----------------------------------------

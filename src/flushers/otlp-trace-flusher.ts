@@ -49,6 +49,12 @@ const logger = createLogger('otlp-trace-flusher');
 
 const VALID_TRACE_ID_RE = /^[0-9a-f]{32}$/;
 const TERMINAL_FINISH_REASONS = new Set(['stop', 'end_turn', 'cancelled', 'error']);
+
+// A failed turn ends with a terminal `error` LLM response instead of a Stop
+// hook. Those records carry error.type; the converter does not translate it
+// into span status, so the qoder variants get the same post-conversion
+// enrichment the other agents already have.
+const QODER_FAILURE_AGENT_TYPES = new Set(['qoder', 'qoder-cli', 'qoder-cn', 'qoder-idea']);
 // Claude Code marks a failed attempt (mid-turn retry or terminal API failure)
 // with finish_reasons=['error']. 'error' must NOT be a turn boundary on its own,
 // or a mid-turn retry would flush the turn before its later records arrive; the
@@ -1137,6 +1143,9 @@ export class OtlpTraceFlusher extends BaseFlusher {
       if (agentType === 'grok-build') {
         this.enrichGrokBuildSpans(records, spans, grokMetadata);
       }
+      if (QODER_FAILURE_AGENT_TYPES.has(agentType)) {
+        this.enrichQoderFailureAttributes(records, spans);
+      }
 
       spans = await this.spanEnrichers.enrich(spans, { agentType, serviceName });
       const exportState = this.getOrCreateExportState(agentType, serviceName);
@@ -1403,6 +1412,84 @@ export class OtlpTraceFlusher extends BaseFlusher {
           message: 'model request failed',
         });
       }
+    }
+  }
+
+  private enrichQoderFailureAttributes(
+    records: AgentActivityEntry[],
+    spans: ReadableSpan[],
+  ): void {
+    const failedTurns = new Map<string, { type: string }>();
+    const failedResponseIds = new Set<string>();
+    for (const record of records) {
+      if (record['event.name'] !== 'llm.response') continue;
+      const reasons = record['gen_ai.response.finish_reasons'];
+      const errorType = record['error.type'];
+      const isFailure = (Array.isArray(reasons) && reasons.includes('error'))
+        || (typeof errorType === 'string' && errorType.length > 0);
+      if (!isFailure) continue;
+      const type = typeof errorType === 'string' && errorType ? errorType : 'model_error';
+      const turnId = record['gen_ai.turn.id'];
+      if (typeof turnId === 'string' && turnId.length > 0) {
+        failedTurns.set(turnId, { type });
+      }
+      const responseId = record['gen_ai.response.id'];
+      if (typeof responseId === 'string' && responseId.length > 0) {
+        failedResponseIds.add(responseId);
+      }
+    }
+    if (failedTurns.size === 0 && failedResponseIds.size === 0) return;
+
+    const llmSpansByTurn = new Map<string, ReadableSpan[]>();
+    let lastLlmSpan: ReadableSpan | undefined;
+    const markError = (span: ReadableSpan, type: string): void => {
+      span.attributes['error.type'] = type;
+      span.attributes['error.message'] = 'model request failed';
+      Object.assign(span.status, {
+        code: SpanStatusCode.ERROR,
+        message: 'model request failed',
+      });
+    };
+
+    for (const span of spans) {
+      const kind = span.attributes['gen_ai.span.kind'];
+      if (kind !== 'LLM' && kind !== 'AGENT' && kind !== 'ENTRY') continue;
+      const turnId = span.attributes['gen_ai.turn.id'];
+      const turnFailure = typeof turnId === 'string' ? failedTurns.get(turnId) : undefined;
+      if (kind === 'LLM') {
+        lastLlmSpan = span;
+        if (turnFailure && typeof turnId === 'string') {
+          const list = llmSpansByTurn.get(turnId) ?? [];
+          list.push(span);
+          llmSpansByTurn.set(turnId, list);
+        }
+        continue;
+      }
+      if (turnFailure) markError(span, turnFailure.type);
+    }
+
+    for (const [turnId, llmSpans] of llmSpansByTurn) {
+      const failure = failedTurns.get(turnId);
+      if (!failure) continue;
+      const matched = llmSpans.find(span => {
+        const responseId = span.attributes['gen_ai.response.id'];
+        return typeof responseId === 'string' && failedResponseIds.has(responseId);
+      });
+      // The failed call is always the turn's last LLM response, so fall back to
+      // the latest span when the transcript carried no provider response id.
+      const target = matched ?? llmSpans.reduce((latest, span) => (
+        span.startTime[0] > latest.startTime[0]
+          || (span.startTime[0] === latest.startTime[0] && span.startTime[1] > latest.startTime[1])
+          ? span
+          : latest
+      ));
+      markError(target, failure.type);
+    }
+
+    // Single failed turn whose LLM span lost gen_ai.turn.id during conversion:
+    // still mark the final LLM span instead of exporting an unremarkable trace.
+    if (llmSpansByTurn.size === 0 && failedTurns.size === 1 && lastLlmSpan) {
+      markError(lastLlmSpan, [...failedTurns.values()][0].type);
     }
   }
 
